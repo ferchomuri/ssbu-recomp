@@ -294,6 +294,7 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
     want = mem_estimate(src, function_sizes(src)) if MEM_BUDGET else 0      # Linux / macOS: this compile's share of RAM
     raised = ''
     tried = None
+    clang_aborted = False
     for step, limit in enumerate((OPTNONE_LINES, OPTNONE_LINES // 4, OPTNONE_LINES // 16)):
         if step < first:
             continue
@@ -322,6 +323,12 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
                 raised = ' (memory reservation raised to %.1f GB)' % (want / 2.0 ** 30)
                 continue
             break
+        # Clang may abort on huge generated functions even after optnone is applied.
+        # Unlike ordinary compile errors, retry this file as a whole at -O0.
+        if code in (134, -signal.SIGABRT):
+            clang_aborted = True
+            print('  %s: Clang aborted; retrying whole file at -O0' % name, flush=True)
+            break
         if code is not None:
             note = ''
             if count:
@@ -339,8 +346,10 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
             mem_release(want)
     if r.returncode == 0:
         ladder_save(objdir, name, key, 3)
-    return r.returncode, (r.stdout + r.stderr)[-2000:], total, 'WHOLE FILE at -O0 (time limit %.0fs%s exceeded three times)' % (
-        time_limit, ' or memory limit %.1f GB' % (MEM_LIMIT / 2.0 ** 30) if MEM_LIMIT else '')
+    reason = ('Clang aborted at optimised level' if clang_aborted else
+              'time limit %.0fs%s exceeded three times' % (
+                  time_limit, ' or memory limit %.1f GB' % (MEM_LIMIT / 2.0 ** 30) if MEM_LIMIT else ''))
+    return r.returncode, (r.stdout + r.stderr)[-2000:], total, 'WHOLE FILE at -O0 (%s)' % reason
 
 
 _tries = collections.Counter()
