@@ -182,6 +182,23 @@ def out_of_memory(code, out):
     return MEM_LIMIT and code and ('out of memory' in out or 'bad_alloc' in out or 'Cannot allocate memory' in out or code < 0)
 
 
+# Clang's driver often returns 1 while the note says the -cc1 child got 134 (SIGABRT) / 139 (SIGSEGV). Under prlimit the
+# real cause is usually std::bad_alloc at the *start* of the log; the last 2 KB kept for FAILED lines only has the crash
+# trailer ("exit code 134", bug-report paths). Detect both before deciding the fallback.
+_CRASH_CODES = frozenset((134, 139, 132, 136,
+                          -signal.SIGABRT, -signal.SIGSEGV, -signal.SIGILL, -signal.SIGFPE))
+
+
+def clang_crashed(code, out):
+    """True when clang aborted / segfaulted (recoverable: fall back to -O0), not an ordinary compile error."""
+    if code is None or code == 0:
+        return False
+    if code in _CRASH_CODES:
+        return True
+    return ('clang frontend command failed with exit code' in out or
+            'PLEASE ATTACH THE FOLLOWING FILES TO THE BUG REPORT' in out)
+
+
 OOM = 'out of memory'                    # run_limited's output when the memory limit stopped the compiler
 
 
@@ -193,11 +210,12 @@ def run_limited(cmd, limit, mem=0):
         cmd = ['prlimit', '--as=%d' % (mem or MEM_LIMIT), '--'] + cmd      # util-linux; inherited by clang's -cc1 child
     p = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, start_new_session=(os.name != 'nt'))
     try:
-        out, _ = p.communicate(timeout=limit)
-        out = out.decode('latin-1')[-2000:]
-        if out_of_memory(p.returncode, out):
+        raw, _ = p.communicate(timeout=limit)
+        full = raw.decode('latin-1')
+        # Classify on the full log: bad_alloc is printed first, the crash trailer last (truncation must not hide OOM).
+        if out_of_memory(p.returncode, full):
             return None, OOM, time.time() - t
-        return p.returncode, out, time.time() - t
+        return p.returncode, full[-2000:], time.time() - t
     except subprocess.TimeoutExpired:
         if os.name == 'nt':
             subprocess.run(['taskkill', '/PID', str(p.pid), '/T', '/F'], capture_output=True)      # this compiler and its -cc1 child only
@@ -294,6 +312,7 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
     want = mem_estimate(src, function_sizes(src)) if MEM_BUDGET else 0      # Linux / macOS: this compile's share of RAM
     raised = ''
     tried = None
+    clang_aborted = False
     for step, limit in enumerate((OPTNONE_LINES, OPTNONE_LINES // 4, OPTNONE_LINES // 16)):
         if step < first:
             continue
@@ -317,10 +336,19 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
                     mem_release(want)
             total += secs
             if code is None and out == OOM and want and want < MEM_BUDGET:     # Linux: over its reservation, not the budget
+                prev = want
                 mem_floor_raise(want)
                 want = min(MEM_BUDGET, want * 2)
                 raised = ' (memory reservation raised to %.1f GB)' % (want / 2.0 ** 30)
+                print('  %s: out of memory at %.1f GB reservation; retrying with %.1f GB' % (
+                    name, prev / 2.0 ** 30, want / 2.0 ** 30), flush=True)
                 continue
+            break
+        # Clang may abort on huge generated functions even after optnone (driver exit often 1; see clang_crashed).
+        # Unlike ordinary compile errors, retry this file as a whole at -O0.
+        if clang_crashed(code, out):
+            clang_aborted = True
+            print('  %s: Clang crashed (exit %s); falling back to whole-file -O0' % (name, code), flush=True)
             break
         if code is not None:
             note = ''
@@ -328,19 +356,30 @@ def compile_file(src, obj, base_flags, time_limit=None, extra=None):
                 note = '%d function(s) over %d statements unoptimised (%d statements)' % (count, limit, lines)
             if code == 0:
                 ladder_save(objdir, name, key, step)
+            elif note:
+                print('  %s: compile failed (exit %s), not a recoverable Clang crash' % (name, code), flush=True)
             return code, out, total, note + (' (step known from _ladder.json)' if first else '') + raised
+    # Final -O0: no prlimit AS cap (huge files need headroom the optimised estimate understates); still pace via mem_acquire.
     cmd = [CLANG, '-c', '-O0'] + extra + base_flags + [src, '-o', obj]
     if want:
         mem_acquire(want)
     try:
+        t_o0 = time.time()
         r = subprocess.run(cmd, capture_output=True, text=True)
+        total += time.time() - t_o0
     finally:
         if want:
             mem_release(want)
+    out0 = (r.stdout + r.stderr)[-2000:]
     if r.returncode == 0:
         ladder_save(objdir, name, key, 3)
-    return r.returncode, (r.stdout + r.stderr)[-2000:], total, 'WHOLE FILE at -O0 (time limit %.0fs%s exceeded three times)' % (
-        time_limit, ' or memory limit %.1f GB' % (MEM_LIMIT / 2.0 ** 30) if MEM_LIMIT else '')
+        print('  %s: recovered at -O0' % name, flush=True)
+    else:
+        print('  %s: FAILED even at whole-file -O0 (exit %s)' % (name, r.returncode), flush=True)
+    reason = ('Clang crashed at optimised level' if clang_aborted else
+              'time limit %.0fs%s exceeded three times' % (
+                  time_limit, ' or memory limit %.1f GB' % (MEM_LIMIT / 2.0 ** 30) if MEM_LIMIT else ''))
+    return r.returncode, out0, total, 'WHOLE FILE at -O0 (%s)' % reason
 
 
 _tries = collections.Counter()
