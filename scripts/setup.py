@@ -189,9 +189,11 @@ class Ctx:
         env.update(extra)
         return env
 
-    def run(self, step, argv, cwd=None, env=None, log=None, ok=(0,), timeout=None):
+    def run(self, step, argv, cwd=None, env=None, log=None, ok=(0,), timeout=None, progress_re=None):
         """Run a child, its output to logs/<log or step>.log; returns this run's output (its last 256 KB). Raises Fail on a
-        bad exit code, TimedOut (a Fail) when it runs longer than timeout seconds (the child is killed)."""
+        bad exit code, TimedOut (a Fail) when it runs longer than timeout seconds (the child is killed).
+
+        progress_re: if set, lines matching this regex are also printed to the console (compile progress, recoveries)."""
         os.makedirs(self.logs, exist_ok=True)
         path = os.path.join(self.logs, (log or step) + '.log')
         t0 = time.time()
@@ -200,14 +202,45 @@ class Ctx:
             f.flush()                            # the header goes above the child's output, not after it
             start = f.tell()                     # the log is appended to: only what this child wrote is returned, or a
             try:                                 # caller's check reads the result of an earlier, failed run
-                p = subprocess.run(argv, cwd=cwd or self.work, env=env or self.env(), stdout=f, stderr=subprocess.STDOUT, timeout=timeout)
+                if progress_re:
+                    import re as _re
+                    rx = _re.compile(progress_re)
+                    p = subprocess.Popen(argv, cwd=cwd or self.work, env=env or self.env(),
+                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+                    assert p.stdout is not None
+                    try:
+                        while True:
+                            line = p.stdout.readline()
+                            if not line and p.poll() is not None:
+                                break
+                            if not line:
+                                continue
+                            f.write(line)
+                            f.flush()
+                            text = line.decode('utf-8', 'replace')
+                            if rx.search(text):
+                                sys.stdout.write(text)
+                                sys.stdout.flush()
+                        if timeout is not None:
+                            p.wait(timeout=max(0.1, timeout - (time.time() - t0)))
+                        else:
+                            p.wait()
+                    except subprocess.TimeoutExpired:
+                        p.kill()
+                        p.wait()
+                        raise TimedOut('%s did not finish in %s (stopped); see %s' % (' '.join(argv[:3]), fmt(timeout), path))
+                    rc = p.returncode
+                else:
+                    completed = subprocess.run(argv, cwd=cwd or self.work, env=env or self.env(),
+                                               stdout=f, stderr=subprocess.STDOUT, timeout=timeout)
+                    rc = completed.returncode
             except subprocess.TimeoutExpired:
                 raise TimedOut('%s did not finish in %s (stopped); see %s' % (' '.join(argv[:3]), fmt(timeout), path))
         with open(path, 'rb') as f:
             f.seek(max(start, os.path.getsize(path) - (256 << 10)))
             tail = f.read().decode('utf-8', 'replace')
-        if p.returncode not in ok:
-            raise Fail('%s failed (exit %s) after %s; see %s\n%s' % (' '.join(argv[:3]), p.returncode, fmt(time.time() - t0), path, tail[-1500:]))
+        if rc not in ok:
+            raise Fail('%s failed (exit %s) after %s; see %s\n%s' % (' '.join(argv[:3]), rc, fmt(time.time() - t0), path, tail[-1500:]))
         return tail
 
 
@@ -1016,8 +1049,15 @@ def step_sdk(cx):
 def inline_flag(cx):
     """RECOMP_INLINE for the game's compile (tools/lifter/build_opt.py): the guest load / store / flag / NEON helpers inlined
     into the lifted code, the main thread about 25-30 % faster; --no-inline turns it off. Objects compiled before keep
-    what they were compiled with until they are compiled again."""
-    return '0' if getattr(cx.a, 'no_inline', False) else '1'
+    what they were compiled with until they are compiled again.
+
+    Precedence: --no-inline wins; else an explicit RECOMP_INLINE in the environment is kept (setup used to overwrite a
+    shell export of RECOMP_INLINE=0 with 1); else default on."""
+    if getattr(cx.a, 'no_inline', False):
+        return '0'
+    if 'RECOMP_INLINE' in os.environ:
+        return '0' if os.environ['RECOMP_INLINE'] in ('', '0') else '1'
+    return '1'
 
 
 def build_env(cx):
@@ -1056,9 +1096,20 @@ def copy_ffmpeg(cx):
 
 
 def step_compile(cx):
+    # --from compile does not re-run stage: refresh the compiler driver so local fixes to build_opt.py apply.
+    for name in ('build_opt.py', 'build.py', 'build_nro.py'):
+        src = os.path.join(REPO, 'tools', 'lifter', name)
+        if os.path.isfile(src):
+            n = copy_if_changed(src, os.path.join(cx.work, name))
+            if n:
+                say('  updated %s from the repository' % name)
     if cx.posix:
         say('  up to %d compilers at once, sharing the RAM (logs/compile.log shows the progress)' % cx.jobs)
-    cx.run('compile', [sys.executable, 'build_opt.py', 'main', str(cx.jobs)], env=build_env(cx))
+        say('  live progress below: N/total counts, Clang crash→-O0 recoveries, and definitive FAILUREs')
+        say('  RECOMP_INLINE=%s' % inline_flag(cx))
+    # Mirror progress / recovery / failure lines to the console so a multi-hour compile is not a black box.
+    cx.run('compile', [sys.executable, 'build_opt.py', 'main', str(cx.jobs)], env=build_env(cx),
+           progress_re=r'(^\s*\d+/\d+\s+|Clang crashed|falling back|recovered at -O0|out of memory at|FAILED|compiled:)')
     dll = os.path.join(cx.work, game_lib(cx))
     say('  %s %.0f MB; objects %.0f MB' % (game_lib(cx), os.path.getsize(dll) / 1048576.0, disk_mb(os.path.join(cx.work, 'obj_eh_o1'))))
 
